@@ -1,0 +1,14 @@
+[Unit]
+Description=Speakerbonnet interface
+After=multi-user.target
+
+[Service]
+ExecStart=/home/pi/projects/matrixpad/mpad.sh
+ExecStop=kill $(ps ax | grep "[p]ython3 mpad.py" | awk '{print $1}')
+User=pi
+Group=pi
+
+[Install]
+WantedBy=multi-user.target
+
+

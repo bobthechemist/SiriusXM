@@ -6,6 +6,7 @@ import json
 import time, datetime
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from secrets import secrets
 
 class SiriusXM:
     USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/604.5.6 (KHTML, like Gecko) Version/11.0.3 Safari/604.5.6'
@@ -25,10 +26,10 @@ class SiriusXM:
         print('{} <SiriusXM>: {}'.format(datetime.datetime.now().strftime('%d.%b %Y %H:%M:%S'), x))
 
     def is_logged_in(self):
-        return 'SXMAUTH' in self.session.cookies
+        return 'SXMAUTHNEW' in self.session.cookies
 
     def is_session_authenticated(self):
-        return 'AWSELB' in self.session.cookies and 'JSESSIONID' in self.session.cookies
+        return 'AWSALB' in self.session.cookies and 'JSESSIONID' in self.session.cookies
 
     def get(self, method, params, authenticate=True):
         if authenticate and not self.is_session_authenticated() and not self.authenticate():
@@ -351,13 +352,14 @@ def make_sirius_handler(sxm):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='SiriusXM proxy')
-    parser.add_argument('username')
-    parser.add_argument('password')
+    #parser.add_argument('username')
+    #parser.add_argument('password')
     parser.add_argument('-l', '--list', required=False, action='store_true', default=False)
     parser.add_argument('-p', '--port', required=False, default=9999, type=int)
     args = vars(parser.parse_args())
     
-    sxm = SiriusXM(args['username'], args['password'])
+    sxm = SiriusXM(secrets['username'], secrets['password'])
+    #sxm = SiriusXM(args['username'], args['password'])
     if args['list']:
         channels = list(sorted(sxm.get_channels(), key=lambda x: (not x.get('isFavorite', False), int(x.get('siriusChannelNumber', 9999)))))
         
