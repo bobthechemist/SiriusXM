@@ -1,3 +1,38 @@
+"""
+SiriusXM Proxy Server
+
+This script implements a proxy server for accessing SiriusXM radio streams. 
+It handles authentication, retrieves channel information, and serves audio segments to clients.
+
+Usage:
+    python siriusxm_proxy.py [-l] [-p PORT]
+
+Arguments:
+    -l, --list      List available SiriusXM channels.
+    -p PORT, --port PORT  Specify the port for the proxy server (default: 9999).
+
+Authentication:
+    SiriusXM credentials (username and password) are stored in a separate file named 'my_secrets.py' 
+    in the following format:
+
+    secrets = {
+        'username': 'your_username',
+        'password': 'your_password'
+    }
+
+Dependencies:
+    - requests
+    - base64
+    - urllib.parse
+    - json
+    - time
+    - datetime
+    - sys
+    - http.server
+    - logging
+    - argparse
+
+"""
 import argparse
 import requests
 import base64
@@ -6,9 +41,44 @@ import json
 import time, datetime
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from secrets import secrets
+from my_secrets import secrets
+import logging
+import Adafruit_IO
+
+
+# Better logging solution
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Data storage via Adafruit IO
+aio = Adafruit_IO.Client(secrets['aio_user'], secrets['aio_key'])
+now_playing_feed = aio.feeds('now-playing') # Assumes the feed exists
 
 class SiriusXM:
+    """
+    Handles SiriusXM authentication and stream retrieval.
+
+    Attributes:
+        USER_AGENT (str): User-Agent string for HTTP requests.
+        REST_FORMAT (str): Base URL for SiriusXM REST API.
+        LIVE_PRIMARY_HLS (str): Base URL for HLS streams.
+
+    Methods:
+        log(message, level): Logs messages with specified level.
+        is_logged_in(): Checks if user is logged in.
+        is_session_authenticated(): Checks if session is authenticated.
+        get(method, params, authenticate): Makes a GET request to the SiriusXM API.
+        post(method, postdata, authenticate): Makes a POST request to the SiriusXM API.
+        login(): Performs login to SiriusXM.
+        authenticate(): Authenticates the session.
+        get_sxmak_token(): Retrieves the SXMAKTOKEN from cookies.
+        get_gup_id(): Retrieves the gupId from cookies.
+        get_playlist_url(guid, channel_id, use_cache, max_attempts): Retrieves the playlist URL for a channel.
+        get_playlist_variant_url(url): Retrieves the playlist variant URL.
+        get_playlist(name, use_cache): Retrieves the HLS playlist for a channel.
+        get_segment(path, max_attempts): Retrieves a segment of the audio stream.
+        get_channels(): Retrieves the list of available channels.
+        get_channel(name): Retrieves channel information by name or ID.
+    """
     USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/604.5.6 (KHTML, like Gecko) Version/11.0.3 Safari/604.5.6'
     REST_FORMAT = 'https://player.siriusxm.com/rest/v2/experience/modules/{}'
     LIVE_PRIMARY_HLS = 'https://siriusxm-priprodlive.akamaized.net'
@@ -21,9 +91,14 @@ class SiriusXM:
         self.playlists = {}
         self.channels = None
 
-    @staticmethod
-    def log(x):
-        print('{} <SiriusXM>: {}'.format(datetime.datetime.now().strftime('%d.%b %Y %H:%M:%S'), x))
+    # Wrapper for logging may not be needed
+    def log(self, message, level="DEBUG"):
+        if level == "DEBUG":
+            logging.debug(message)
+        elif level == "INFO": # and so on for other levels
+            logging.info(message)
+        elif level == "ERROR":
+            logging.error(message)
 
     def is_logged_in(self):
         return 'SXMAUTHNEW' in self.session.cookies
@@ -51,7 +126,8 @@ class SiriusXM:
         if authenticate and not self.is_session_authenticated() and not self.authenticate():
             self.log('Unable to authenticate')
             return None
-
+        req = 'wassup'
+        print(self.REST_FORMAT.format(method))
         res = self.session.post(self.REST_FORMAT.format(method), data=json.dumps(postdata))
         if res.status_code != 200:
             self.log('Received status code {} for method \'{}\''.format(res.status_code, method))
@@ -147,9 +223,7 @@ class SiriusXM:
         except (KeyError, ValueError):
             return None
 
-    def get_playlist_url(self, guid, channel_id, use_cache=True, max_attempts=5):
-        if use_cache and channel_id in self.playlists:
-             return self.playlists[channel_id]
+    def get_playlist_info(self, guid, channel_id, use_cache=False, max_attempts=5):
 
         params = {
             'assetGUID': guid,
@@ -180,6 +254,109 @@ class SiriusXM:
                 self.log('Session expired, logging in and authenticating')
                 if self.authenticate():
                     self.log('Successfully authenticated')
+                else:
+                    self.log('Failed to authenticate')
+                    return None
+            else:
+                self.log('Reached max attempts for playlist')
+                return None
+        elif message_code != 100:
+            self.log('Received error {} {}'.format(message_code, message))
+            return None
+
+        # get m3u8 url
+        try:
+            playlists = data['ModuleListResponse']['moduleList']['modules'][0]['moduleResponse']['liveChannelData']['hlsAudioInfos']
+            mydata = data['ModuleListResponse']['moduleList']['modules'][0]['moduleResponse']['liveChannelData']
+            self.log(mydata['markerLists'][3]['markers'][-1]['cut']['title'])
+        except (KeyError, IndexError):
+            self.log('Error parsing json response for playlist')
+            return None
+        for playlist_info in playlists:
+            if playlist_info['size'] == 'LARGE':
+                playlist_url = playlist_info['url'].replace('%Live_Primary_HLS%', self.LIVE_PRIMARY_HLS)
+                self.playlists[channel_id] = self.get_playlist_variant_url(playlist_url)
+                return data['ModuleListResponse']['moduleList']['modules'][0]['moduleResponse']['liveChannelData']
+
+        return None
+
+    def get_song_info(self, guid, channel_id, full_data=False):
+        params = {
+            'assetGUID': guid,
+            'ccRequestType': 'AUDIO_VIDEO',
+            'channelId': channel_id,
+            'hls_output_mode': 'custom',
+            'marker_mode': 'all_separate_cue_points',
+            'result-template': 'web',
+            'time': int(round(time.time() * 1000.0)),
+            'timestamp': datetime.datetime.utcnow().isoformat('T') + 'Z'
+        }
+        data = self.get('tune/now-playing-live', params)
+        if not data:
+            return None
+
+        # get song info
+        musicdata = data['ModuleListResponse']['moduleList']['modules'][0]['moduleResponse']['liveChannelData']
+        station = musicdata['markerLists'][0]['markers'][0]['episode']['longTitle']
+        logging.info("STATION: {}".format(station))
+        logging.info("SONG: {}".format(musicdata['markerLists'][3]['markers'][-1]['cut']['title']))
+        logging.info("ARTIST: {}".format(musicdata['markerLists'][3]['markers'][-1]['cut']['artists'][0]['name']))
+
+        # post to Adafruit_IO
+        try:
+            data_to_send = {
+                'title': musicdata['markerLists'][3]['markers'][-1]['cut']['title'],
+                'artist': musicdata['markerLists'][3]['markers'][-1]['cut']['artists'][0]['name'],
+                'station': station,
+                'playing': True,
+            }
+            aio.send_data(now_playing_feed.key, json.dumps(data_to_send))
+            logging.debug('Data successfully sent to Adafruit')
+        except Adafruit_IO.RequestError as e:
+            logging.error("Error updating Adafruit-IO: {}".format(e))
+
+        if full_data:
+            return data
+        else:
+            return None        
+
+    def get_playlist_url(self, guid, channel_id, use_cache=True, max_attempts=5):
+        # Get song info - this adds a SiriusXM call
+        self.get_song_info(guid, channel_id)
+
+        if use_cache and channel_id in self.playlists:
+             return self.playlists[channel_id]
+
+        params = {
+            'assetGUID': guid,
+            'ccRequestType': 'AUDIO_VIDEO',
+            'channelId': channel_id,
+            'hls_output_mode': 'custom',
+            'marker_mode': 'all_separate_cue_points',
+            'result-template': 'web',
+            'time': int(round(time.time() * 1000.0)),
+            'timestamp': datetime.datetime.utcnow().isoformat('T') + 'Z'
+        }
+        data = self.get('tune/now-playing-live', params)
+        if not data:
+            return None
+
+
+        # get status
+        try:
+            status = data['ModuleListResponse']['status']
+            message = data['ModuleListResponse']['messages'][0]['message']
+            message_code = data['ModuleListResponse']['messages'][0]['code']
+        except (KeyError, IndexError):
+            self.log('Error parsing json response for playlist')
+            return None
+
+        # login if session expired
+        if message_code == 201 or message_code == 208:
+            if max_attempts > 0:
+                self.log('Session expired, logging in and authenticating')
+                if self.authenticate():
+                    self.log('Successfully authenticated')
                     return self.get_playlist_url(guid, channel_id, use_cache, max_attempts - 1)
                 else:
                     self.log('Failed to authenticate')
@@ -194,6 +371,7 @@ class SiriusXM:
         # get m3u8 url
         try:
             playlists = data['ModuleListResponse']['moduleList']['modules'][0]['moduleResponse']['liveChannelData']['hlsAudioInfos']
+
         except (KeyError, IndexError):
             self.log('Error parsing json response for playlist')
             return None
@@ -229,6 +407,8 @@ class SiriusXM:
         if not guid or not channel_id:
             self.log('No channel for {}'.format(name))
             return None
+
+        # inefficient hack to get title
 
         url = self.get_playlist_url(guid, channel_id, use_cache)
         params = {
@@ -308,6 +488,7 @@ class SiriusXM:
                 return []
         return self.channels
 
+    
     def get_channel(self, name):
         name = name.lower()
         for x in self.get_channels():
@@ -316,12 +497,31 @@ class SiriusXM:
         return (None, None)
 
 def make_sirius_handler(sxm):
+    """
+    Creates a request handler class for the HTTP server.
+
+    Args:
+        sxm (SiriusXM): An instance of the SiriusXM class.
+
+    Returns:
+        SiriusHandler: A class derived from BaseHTTPRequestHandler.
+    """
     class SiriusHandler(BaseHTTPRequestHandler):
+        """
+        Handles HTTP requests for the proxy server.
+
+        Attributes:
+            HLS_AES_KEY (bytes): AES decryption key for HLS segments.
+
+        Methods:
+            do_GET(): Handles GET requests for playlists and segments.
+        """
         HLS_AES_KEY = base64.b64decode('0Nsco7MAgxowGvkUT8aYag==')
 
         def do_GET(self):
             if self.path.endswith('.m3u8'):
                 data = sxm.get_playlist(self.path.rsplit('/', 1)[1][:-5])
+                logging.debug("do_GET wants: {}".format(self.path.rsplit('/', 1)[1][:-5]))
                 if data:
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/x-mpegURL')
@@ -332,6 +532,7 @@ def make_sirius_handler(sxm):
                     self.end_headers()
             elif self.path.endswith('.aac'):
                 data = sxm.get_segment(self.path[1:])
+                logging.debug("do_GET wants {}".format(self.path[1:]))
                 if data:
                     self.send_response(200)
                     self.send_header('Content-Type', 'audio/x-aac')
