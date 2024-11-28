@@ -1,5 +1,6 @@
 # Don't share your secrets
 secrets.py
+my-secrets.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
